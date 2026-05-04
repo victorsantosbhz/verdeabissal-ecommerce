@@ -100,6 +100,27 @@ class ML_Sync {
     public function sync_stock_to_ml($product) {
         // Lógica para atualizar estoque no ML quando o estoque mudar no WC
     }
+
+    /**
+     * Auxiliar para baixar e anexar imagens do ML ao produto do WC
+     */
+    private function handle_product_images($product_id, $pictures) {
+        require_once(ABSPATH . 'wp-admin/includes/media.php');
+        require_once(ABSPATH . 'wp-admin/includes/file.php');
+        require_once(ABSPATH . 'wp-admin/includes/image.php');
+
+        foreach ($pictures as $index => $pic) {
+            $image_url = $pic['url'];
+            // Baixa a imagem e anexa ao post
+            $img_id = media_sideload_image($image_url, $product_id, null, 'id');
+
+            if (!is_wp_error($img_id)) {
+                if ($index === 0) {
+                    set_post_thumbnail($product_id, $img_id); // Define como imagem principal
+                }
+            }
+        }
+    }
 }
 
 new ML_Sync();
