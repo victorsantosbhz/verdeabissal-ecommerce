@@ -1,0 +1,33 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: verdeabissal_db
+    restart: always
+    environment:
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: ${DB_PASSWORD:-wordpress_pass}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root_pass}
+    volumes:
+      - db_data:/var/lib/mysql
+
+  wordpress:
+    build: .
+    container_name: verdeabissal_app
+    restart: always
+    ports:
+      - "8000:80"
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: ${DB_PASSWORD:-wordpress_pass}
+      WORDPRESS_DB_NAME: wordpress
+    volumes:
+      - wp_data:/var/www/html
+      - ./wp-content/plugins/ml-sync:/var/www/html/wp-content/plugins/ml-sync
+    depends_on:
+      - db
+
+volumes:
+  db_data:
+  wp_data:
