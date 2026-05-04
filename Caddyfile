@@ -1,0 +1,10 @@
+{
+    email your-email@example.com
+}
+
+http://verdeabissal.localhost {
+    reverse_proxy wordpress:80
+}
+
+# Se você configurar um domínio no ngrok, pode usar aqui também
+# ou deixar o ngrok apontar direto para o container wordpress

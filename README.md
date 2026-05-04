@@ -19,14 +19,23 @@ Este projeto é um e-commerce baseado em WordPress + WooCommerce com integraçã
    ```bash
    cp .env.example .env
    ```
-2. Configure as variáveis `ML_CLIENT_ID` e `ML_CLIENT_SECRET` com os dados obtidos no [Mercado Livre Dev Center](https://developers.mercadolivre.com.br/dev-center).
+2. Configure o `NGROK_AUTHTOKEN` no seu `.env`.
+3. Configure as variáveis `ML_CLIENT_ID` e `ML_CLIENT_SECRET`.
 
 ### 3. Rodar o Ambiente
 Suba os containers:
 ```bash
 docker-compose up -d
 ```
-O site estará disponível em `http://localhost:8000`.
+O site estará disponível localmente em `http://verdeabissal.localhost`.
+
+### 4. Acesso Público (Webhooks/OAuth)
+Para que o Mercado Livre consiga se comunicar com seu servidor local:
+1. Verifique a URL gerada pelo ngrok nos logs do container:
+   ```bash
+   docker logs verdeabissal_tunnel
+   ```
+2. Use essa URL (ex: `https://abcd-123.ngrok-free.app`) para atualizar o seu `ML_REDIRECT_URI` no `.env` e no painel do Mercado Livre.
 
 ### 4. Configuração Inicial do WordPress
 1. Acesse `http://localhost:8000` e siga os passos de instalação do WordPress.

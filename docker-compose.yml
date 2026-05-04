@@ -10,13 +10,13 @@ services:
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root_pass}
     volumes:
       - db_data:/var/lib/mysql
+    networks:
+      - verdeabissal_net
 
   wordpress:
     build: .
     container_name: verdeabissal_app
     restart: always
-    ports:
-      - "8000:80"
     environment:
       WORDPRESS_DB_HOST: db:3306
       WORDPRESS_DB_USER: wordpress
@@ -27,7 +27,45 @@ services:
       - ./wp-content/plugins/ml-sync:/var/www/html/wp-content/plugins/ml-sync
     depends_on:
       - db
+    networks:
+      - verdeabissal_net
+
+  caddy:
+    image: caddy:latest
+    container_name: verdeabissal_proxy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - wordpress
+    networks:
+      - verdeabissal_net
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: verdeabissal_tunnel
+    restart: always
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    command:
+      - "http"
+      - "wordpress:80"
+    depends_on:
+      - wordpress
+    networks:
+      - verdeabissal_net
+
+networks:
+  verdeabissal_net:
+    driver: bridge
 
 volumes:
   db_data:
   wp_data:
+  caddy_data:
+  caddy_config:
