@@ -1,0 +1,17 @@
+# Docker
+.env
+
+# WordPress Data
+# Se quiser ignorar o core do WordPress mas manter seus plugins/uploads, 
+# você pode refinar estas regras depois.
+wordpress_data/wp-admin/
+wordpress_data/wp-includes/
+wordpress_data/*.php
+!wordpress_data/wp-content/
+
+# Database data (Nunca suba isso para o GitHub)
+db_data/
+
+# OS files
+.DS_Store
+Thumbs.db
