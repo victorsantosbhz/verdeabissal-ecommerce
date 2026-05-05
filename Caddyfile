@@ -2,7 +2,7 @@
     email your-email@example.com
 }
 
-http://verdeabissal.localhost {
+:80 {
     reverse_proxy wordpress:80
 }
 

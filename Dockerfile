@@ -4,7 +4,7 @@ FROM wordpress:latest
 RUN apt-get update && apt-get install -y unzip && rm -rf /var/lib/apt/lists/*
 
 # Download and install WooCommerce plugin
-RUN curl -o woocommerce.zip -L https://downloads.wordpress.org/plugin/woocommerce.latest.zip \
+RUN curl -o woocommerce.zip -L https://downloads.wordpress.org/plugin/woocommerce.zip \
     && unzip woocommerce.zip -d /usr/src/wordpress/wp-content/plugins/ \
     && rm woocommerce.zip
 
