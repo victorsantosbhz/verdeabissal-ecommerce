@@ -13,11 +13,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 class ML_Sync {
     private $api_url = 'https://api.mercadolibre.com';
     private $option_name = 'ml_sync_settings';
+    private $history_table_version = '1.0';
 
     public function __construct() {
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
         add_action('admin_init', [$this, 'handle_actions']);
+        add_action('admin_init', [$this, 'maybe_install_history_table']);
         add_action('rest_api_init', [$this, 'register_rest_routes']);
         
         // Hooks para sincronização (WC -> ML)
@@ -159,12 +161,10 @@ class ML_Sync {
             wp_send_json_error('Título vazio.');
         }
 
-        $url = 'https://api.mercadolibre.com/sites/MLB/category_predictor/predict?title=' . urlencode($title);
-        
-        $response = wp_remote_get($url);
+        $response = $this->request_ml('GET', '/sites/MLB/category_predictor/predict?title=' . urlencode($title));
 
         if (is_wp_error($response)) {
-            wp_send_json_error('Erro na API.');
+            wp_send_json_error('Erro na API: ' . $response->get_error_message());
         }
 
         $body = json_decode(wp_remote_retrieve_body($response), true);
@@ -189,6 +189,92 @@ class ML_Sync {
             'dashicons-update',
             56
         );
+    }
+
+    // --- HISTÓRICO DE SINCRONIZAÇÕES ---
+
+    public function maybe_install_history_table() {
+        if (get_option('ml_sync_history_table_version') === $this->history_table_version) {
+            return;
+        }
+        global $wpdb;
+        $table = $wpdb->prefix . 'ml_sync_history';
+        $charset = $wpdb->get_charset_collate();
+        $sql = "CREATE TABLE {$table} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            created_at DATETIME NOT NULL,
+            direction VARCHAR(20) NOT NULL,
+            action VARCHAR(50) NOT NULL,
+            wc_product_id BIGINT UNSIGNED DEFAULT NULL,
+            ml_item_id VARCHAR(50) DEFAULT NULL,
+            wc_order_id BIGINT UNSIGNED DEFAULT NULL,
+            ml_order_id VARCHAR(50) DEFAULT NULL,
+            status VARCHAR(20) NOT NULL,
+            message TEXT NULL,
+            payload LONGTEXT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_created_at (created_at),
+            KEY idx_wc_product (wc_product_id),
+            KEY idx_ml_item (ml_item_id),
+            KEY idx_action (action)
+        ) {$charset};";
+        require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+        dbDelta($sql);
+        update_option('ml_sync_history_table_version', $this->history_table_version);
+    }
+
+    /**
+     * Registra um evento de sincronização na tabela de histórico.
+     * $direction: 'wc_to_ml' | 'ml_to_wc'
+     * $action: product_create | product_update | product_pictures | stock_update | status_update |
+     *          order_create | order_update | order_fees | order_address
+     * $status: success | error | skipped
+     */
+    private function log_sync($direction, $action, $status, $message = '', $context = []) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'ml_sync_history';
+        $payload = !empty($context['payload']) ? wp_json_encode($context['payload']) : null;
+        if ($payload && strlen($payload) > 60000) {
+            $payload = substr($payload, 0, 60000) . '...[truncado]';
+        }
+        $wpdb->insert($table, [
+            'created_at'    => current_time('mysql'),
+            'direction'     => $direction,
+            'action'        => $action,
+            'wc_product_id' => $context['wc_product_id'] ?? null,
+            'ml_item_id'    => $context['ml_item_id'] ?? null,
+            'wc_order_id'   => $context['wc_order_id'] ?? null,
+            'ml_order_id'   => $context['ml_order_id'] ?? null,
+            'status'        => $status,
+            'message'       => $message,
+            'payload'       => $payload,
+        ]);
+    }
+
+    /**
+     * Retorna a lista ordenada de URLs de fotos do produto WC: featured + galeria.
+     * Usado para enviar TODAS as fotos ao Mercado Livre, não só a destacada.
+     */
+    private function get_product_picture_urls($product) {
+        $urls = [];
+
+        $featured_id = $product->get_image_id();
+        if ($featured_id) {
+            $u = wp_get_attachment_url($featured_id);
+            if ($u) {
+                $urls[] = $u;
+            }
+        }
+
+        $gallery_ids = $product->get_gallery_image_ids();
+        foreach ($gallery_ids as $gid) {
+            $u = wp_get_attachment_url($gid);
+            if ($u && !in_array($u, $urls, true)) {
+                $urls[] = $u;
+            }
+        }
+
+        return $urls;
     }
 
     public function register_settings() {
@@ -272,6 +358,15 @@ class ML_Sync {
             } elseif ($_POST['ml_sync_action'] === 'clear_order_sync_status') {
                 delete_option('ml_order_sync_status');
                 add_settings_error('ml_sync_messages', 'ml_sync_orders_cleared', "Status de sincronização de pedidos limpo.", 'updated');
+            } elseif ($_POST['ml_sync_action'] === 'clear_history') {
+                if (!isset($_POST['ml_clear_history_nonce']) || !wp_verify_nonce($_POST['ml_clear_history_nonce'], 'ml_clear_history')) {
+                    add_settings_error('ml_sync_messages', 'ml_sync_history_nonce', 'Nonce inválido.', 'error');
+                    return;
+                }
+                global $wpdb;
+                $table = $wpdb->prefix . 'ml_sync_history';
+                $deleted = $wpdb->query("DELETE FROM {$table} WHERE created_at < DATE_SUB(NOW(), INTERVAL 30 DAY)");
+                add_settings_error('ml_sync_messages', 'ml_sync_history_cleared', sprintf('%d registro(s) antigo(s) removido(s) do histórico.', (int)$deleted), 'updated');
             } elseif ($_POST['ml_sync_action'] === 'sync_brands') {
                 if (!function_exists('as_enqueue_async_action')) {
                     add_settings_error('ml_sync_messages', 'ml_sync_no_as', "Erro: WooCommerce Action Scheduler não está ativo.", 'error');
@@ -330,15 +425,12 @@ class ML_Sync {
 
         // Paginação para buscar todos os IDs de pedidos do período
         do {
-            $url = $this->api_url . '/orders/search?seller=' . $settings['user_id']
+            $url = '/orders/search?seller=' . $settings['user_id']
                  . '&order.date_created.from=' . urlencode($date_from)
                  . '&limit=' . $limit
                  . '&offset=' . $offset;
 
-            $response = wp_remote_get($url, [
-                'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']],
-                'timeout' => 15
-            ]);
+            $response = $this->request_ml('GET', $url);
 
             if (is_wp_error($response)) break;
 
@@ -423,13 +515,7 @@ class ML_Sync {
     private function get_ml_items_count($settings) {
         if (empty($settings['access_token']) || empty($settings['user_id'])) return 0;
         
-        $url = $this->api_url . '/users/' . $settings['user_id'] . '/items/search';
-        $response = wp_remote_get($url, [
-            'headers' => [
-                'Authorization' => 'Bearer ' . $settings['access_token']
-            ],
-            'timeout' => 5 // Reduz o timeout para evitar prender a página caso a API do ML demore
-        ]);
+        $response = $this->request_ml('GET', '/users/' . $settings['user_id'] . '/items/search');
         
         if (is_wp_error($response)) return 0;
         
@@ -466,15 +552,57 @@ class ML_Sync {
     }
 
     public function admin_page_contents() {
+        $active_tab = isset($_GET['tab']) ? sanitize_key($_GET['tab']) : 'dashboard';
+        $tabs = [
+            'dashboard' => 'Dashboard',
+            'history'   => 'Histórico',
+            'settings'  => 'Configurações',
+        ];
+        if (!isset($tabs[$active_tab])) {
+            $active_tab = 'dashboard';
+        }
+        ?>
+        <div class="wrap">
+            <h1>Mercado Livre Sync</h1>
+            <?php settings_errors('ml_sync_messages'); ?>
+
+            <h2 class="nav-tab-wrapper">
+                <?php foreach ($tabs as $slug => $label):
+                    $url = admin_url('admin.php?page=ml-sync&tab=' . $slug);
+                    $class = ($slug === $active_tab) ? 'nav-tab nav-tab-active' : 'nav-tab';
+                    ?>
+                    <a href="<?php echo esc_url($url); ?>" class="<?php echo esc_attr($class); ?>">
+                        <?php echo esc_html($label); ?>
+                    </a>
+                <?php endforeach; ?>
+            </h2>
+
+            <?php
+            if ($active_tab === 'history') {
+                $this->render_history_tab();
+            } elseif ($active_tab === 'settings') {
+                $this->render_settings_tab();
+            } else {
+                $this->render_dashboard_tab();
+            }
+            ?>
+        </div>
+        <?php
+    }
+
+    private function render_dashboard_tab() {
         $settings = get_option($this->option_name, []);
         $sync_status = get_option('ml_sync_status', 'active');
         $is_connected = !empty($settings['access_token']);
         $import_status = get_option('ml_import_status', ['total' => 0, 'processed' => 0, 'errors' => []]);
         $is_importing = ($import_status['total'] > 0 && $import_status['processed'] < $import_status['total']);
         ?>
-        <div class="wrap">
-            <h1>Dashboard Mercado Livre Sync</h1>
-            <?php settings_errors('ml_sync_messages'); ?>
+        <div style="margin-top: 20px;">
+            <?php if (!$is_connected): ?>
+                <div class="notice notice-warning" style="padding: 12px;">
+                    <p>Você ainda não conectou ao Mercado Livre. Vá até a aba <a href="<?php echo esc_url(admin_url('admin.php?page=ml-sync&tab=settings')); ?>"><strong>Configurações</strong></a> para autenticar.</p>
+                </div>
+            <?php endif; ?>
 
             <?php if ($is_connected): ?>
                 
@@ -688,31 +816,6 @@ class ML_Sync {
                 </div>
             <?php endif; ?>
 
-            <hr style="margin: 30px 0;">
-
-            <h2>Configurações da API</h2>
-            <form method="post" action="options.php">
-                <?php
-                settings_fields('ml_sync_group');
-                do_settings_sections('ml-sync');
-                submit_button('Salvar Configurações');
-                ?>
-            </form>
-            
-            <hr style="margin: 30px 0;">
-
-            <h2>Autenticação</h2>
-            <?php if (!$is_connected): ?>
-                <?php if (get_option('ml_client_id') && get_option('ml_redirect_uri')): ?>
-                    <a href="<?php echo esc_url($this->get_auth_url()); ?>" class="button button-primary button-large">Conectar ao Mercado Livre</a>
-                <?php else: ?>
-                    <p>Preencha e salve as credenciais acima para habilitar o botão de conexão.</p>
-                <?php endif; ?>
-            <?php else: ?>
-                <p style="color: green; font-weight: bold;">✔ Conectado com sucesso!</p>
-                <p><strong>Access Token (Truncado):</strong> <?php echo substr($settings['access_token'], 0, 15) . '...'; ?></p>
-            <?php endif; ?>
-
             <!-- JS para contagem remota de pedidos do ML e polling de progress -->
             <script>
             document.addEventListener('DOMContentLoaded', function() {
@@ -776,10 +879,332 @@ class ML_Sync {
         <?php
     }
 
+    private function render_settings_tab() {
+        $settings = get_option($this->option_name, []);
+        $is_connected = !empty($settings['access_token']);
+        ?>
+        <div style="margin-top: 20px;">
+            <h2>Configurações da API</h2>
+            <form method="post" action="options.php">
+                <?php
+                settings_fields('ml_sync_group');
+                do_settings_sections('ml-sync');
+                submit_button('Salvar Configurações');
+                ?>
+            </form>
+
+            <hr style="margin: 30px 0;">
+
+            <h2>Autenticação</h2>
+            <?php if (!$is_connected): ?>
+                <?php if (get_option('ml_client_id') && get_option('ml_redirect_uri')): ?>
+                    <a href="<?php echo esc_url($this->get_auth_url()); ?>" class="button button-primary button-large">Conectar ao Mercado Livre</a>
+                <?php else: ?>
+                    <p>Preencha e salve as credenciais acima para habilitar o botão de conexão.</p>
+                <?php endif; ?>
+            <?php else: ?>
+                <p style="color: green; font-weight: bold;">✔ Conectado com sucesso!</p>
+                <p><strong>Access Token (Truncado):</strong> <?php echo esc_html(substr($settings['access_token'], 0, 15)) . '...'; ?></p>
+                <?php if (!empty($settings['user_id'])): ?>
+                    <p><strong>User ID:</strong> <?php echo esc_html($settings['user_id']); ?></p>
+                <?php endif; ?>
+            <?php endif; ?>
+
+            <hr style="margin: 30px 0;">
+
+            <h2>Webhooks &amp; Endpoints</h2>
+            <p class="description">URLs internas usadas pelo plugin (referência para configurar no painel do ML):</p>
+            <table class="widefat striped" style="max-width: 700px;">
+                <tbody>
+                    <tr>
+                        <td><strong>Callback OAuth</strong></td>
+                        <td><code><?php echo esc_html(rest_url('ml-sync/v1/auth/callback')); ?></code></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Notificações ML</strong></td>
+                        <td><code><?php echo esc_html(rest_url('ml-sync/v1/notifications')); ?></code></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <?php
+    }
+
+    private function render_history_tab() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'ml_sync_history';
+
+        // Filtros
+        $filter_direction = isset($_GET['filter_direction']) ? sanitize_key($_GET['filter_direction']) : '';
+        $filter_action    = isset($_GET['filter_action']) ? sanitize_key($_GET['filter_action']) : '';
+        $filter_status    = isset($_GET['filter_status']) ? sanitize_key($_GET['filter_status']) : '';
+        $filter_product   = isset($_GET['filter_product']) ? intval($_GET['filter_product']) : 0;
+        $paged = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
+        $per_page = 50;
+        $offset = ($paged - 1) * $per_page;
+
+        $where = ['1=1'];
+        $params = [];
+        if ($filter_direction) { $where[] = 'direction = %s'; $params[] = $filter_direction; }
+        if ($filter_action)    { $where[] = 'action = %s';    $params[] = $filter_action; }
+        if ($filter_status)    { $where[] = 'status = %s';    $params[] = $filter_status; }
+        if ($filter_product)   { $where[] = 'wc_product_id = %d'; $params[] = $filter_product; }
+        $where_sql = implode(' AND ', $where);
+
+        $count_sql = "SELECT COUNT(*) FROM {$table} WHERE {$where_sql}";
+        $list_sql  = "SELECT * FROM {$table} WHERE {$where_sql} ORDER BY id DESC LIMIT %d OFFSET %d";
+
+        if ($params) {
+            $total = (int) $wpdb->get_var($wpdb->prepare($count_sql, $params));
+            $rows  = $wpdb->get_results($wpdb->prepare($list_sql, array_merge($params, [$per_page, $offset])));
+        } else {
+            $total = (int) $wpdb->get_var($count_sql);
+            $rows  = $wpdb->get_results($wpdb->prepare($list_sql, [$per_page, $offset]));
+        }
+
+        $total_pages = max(1, (int) ceil($total / $per_page));
+
+        $action_labels = [
+            'product_create'    => 'Criar produto',
+            'product_update'    => 'Atualizar produto',
+            'product_pictures'  => 'Atualizar fotos',
+            'stock_update'      => 'Atualizar estoque',
+            'status_update'     => 'Atualizar status',
+            'order_create'      => 'Criar pedido',
+            'order_update'      => 'Atualizar pedido',
+            'order_fees'        => 'Sincronizar taxas',
+            'order_address'    => 'Sincronizar endereço',
+        ];
+        ?>
+        <div style="margin-top: 20px;">
+            <p>Registro de todas as sincronizações realizadas entre o WooCommerce e o Mercado Livre.</p>
+
+            <!-- Filtros -->
+            <form method="get" style="background: #fff; padding: 12px; border: 1px solid #ccd0d4; border-radius: 4px; margin-bottom: 15px; display: flex; gap: 10px; align-items: end; flex-wrap: wrap;">
+                <input type="hidden" name="page" value="ml-sync">
+                <input type="hidden" name="tab" value="history">
+
+                <label>Direção
+                    <select name="filter_direction">
+                        <option value="">Todas</option>
+                        <option value="wc_to_ml" <?php selected($filter_direction, 'wc_to_ml'); ?>>WC → ML</option>
+                        <option value="ml_to_wc" <?php selected($filter_direction, 'ml_to_wc'); ?>>ML → WC</option>
+                    </select>
+                </label>
+
+                <label>Ação
+                    <select name="filter_action">
+                        <option value="">Todas</option>
+                        <?php foreach ($action_labels as $val => $lbl): ?>
+                            <option value="<?php echo esc_attr($val); ?>" <?php selected($filter_action, $val); ?>><?php echo esc_html($lbl); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </label>
+
+                <label>Status
+                    <select name="filter_status">
+                        <option value="">Todos</option>
+                        <option value="success" <?php selected($filter_status, 'success'); ?>>Sucesso</option>
+                        <option value="error" <?php selected($filter_status, 'error'); ?>>Erro</option>
+                        <option value="skipped" <?php selected($filter_status, 'skipped'); ?>>Ignorado</option>
+                    </select>
+                </label>
+
+                <label>Produto WC ID
+                    <input type="number" name="filter_product" value="<?php echo esc_attr($filter_product ?: ''); ?>" style="width: 100px;">
+                </label>
+
+                <button type="submit" class="button button-primary">Filtrar</button>
+                <a href="<?php echo esc_url(admin_url('admin.php?page=ml-sync&tab=history')); ?>" class="button">Limpar</a>
+
+                <span style="margin-left: auto;">
+                    <strong><?php echo number_format_i18n($total); ?></strong> registro(s)
+                </span>
+            </form>
+
+            <?php if (empty($rows)): ?>
+                <div class="notice notice-info" style="padding: 12px;"><p>Nenhuma sincronização registrada ainda. Os eventos serão capturados automaticamente conforme produtos e pedidos forem sincronizados.</p></div>
+            <?php else: ?>
+                <table class="widefat striped">
+                    <thead>
+                        <tr>
+                            <th style="width: 140px;">Data/Hora</th>
+                            <th style="width: 90px;">Direção</th>
+                            <th style="width: 140px;">Ação</th>
+                            <th style="width: 80px;">Status</th>
+                            <th style="width: 100px;">Produto WC</th>
+                            <th style="width: 130px;">Item ML</th>
+                            <th>Mensagem</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($rows as $row):
+                            $dir_color = $row->direction === 'wc_to_ml' ? '#2271b1' : '#7e22ce';
+                            $dir_label = $row->direction === 'wc_to_ml' ? 'WC → ML' : 'ML → WC';
+                            $status_color = ['success' => '#00a32a', 'error' => '#d63638', 'skipped' => '#8c8f94'][$row->status] ?? '#666';
+                            $action_label = $action_labels[$row->action] ?? $row->action;
+                            ?>
+                            <tr>
+                                <td><?php echo esc_html(mysql2date('d/m/Y H:i:s', $row->created_at)); ?></td>
+                                <td><span style="color: <?php echo esc_attr($dir_color); ?>; font-weight: bold;"><?php echo esc_html($dir_label); ?></span></td>
+                                <td><?php echo esc_html($action_label); ?></td>
+                                <td><span style="color: <?php echo esc_attr($status_color); ?>; font-weight: bold; text-transform: uppercase;"><?php echo esc_html($row->status); ?></span></td>
+                                <td>
+                                    <?php if ($row->wc_product_id): ?>
+                                        <a href="<?php echo esc_url(get_edit_post_link($row->wc_product_id)); ?>">#<?php echo esc_html($row->wc_product_id); ?></a>
+                                    <?php else: ?>—<?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php if ($row->ml_item_id): ?>
+                                        <a href="https://produto.mercadolivre.com.br/<?php echo esc_attr(str_replace('MLB', 'MLB-', $row->ml_item_id)); ?>" target="_blank" rel="noopener"><?php echo esc_html($row->ml_item_id); ?></a>
+                                    <?php else: ?>—<?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php echo esc_html($row->message); ?>
+                                    <?php if (!empty($row->payload)): ?>
+                                        <details style="margin-top: 4px;">
+                                            <summary style="cursor: pointer; font-size: 11px; color: #2271b1;">Ver payload</summary>
+                                            <pre style="background: #f6f7f7; padding: 8px; max-height: 200px; overflow: auto; font-size: 11px; margin: 4px 0 0;"><?php echo esc_html($row->payload); ?></pre>
+                                        </details>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+
+                <!-- Paginação -->
+                <?php if ($total_pages > 1):
+                    $base_url = add_query_arg([
+                        'page' => 'ml-sync',
+                        'tab'  => 'history',
+                        'filter_direction' => $filter_direction,
+                        'filter_action'    => $filter_action,
+                        'filter_status'    => $filter_status,
+                        'filter_product'   => $filter_product ?: '',
+                    ], admin_url('admin.php'));
+                    ?>
+                    <div class="tablenav" style="margin-top: 15px;">
+                        <div class="tablenav-pages">
+                            <?php
+                            echo paginate_links([
+                                'base'      => $base_url . '%_%',
+                                'format'    => '&paged=%#%',
+                                'current'   => $paged,
+                                'total'     => $total_pages,
+                                'prev_text' => '« Anterior',
+                                'next_text' => 'Próxima »',
+                            ]);
+                            ?>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            <?php endif; ?>
+
+            <hr style="margin: 30px 0;">
+
+            <form method="post" action="" onsubmit="return confirm('Tem certeza? Isso apagará todos os registros do histórico (não afeta produtos ou pedidos).');">
+                <input type="hidden" name="ml_sync_action" value="clear_history">
+                <?php wp_nonce_field('ml_clear_history', 'ml_clear_history_nonce'); ?>
+                <button type="submit" class="button">Limpar histórico antigo</button>
+                <span class="description"> Mantém apenas registros dos últimos 30 dias.</span>
+            </form>
+        </div>
+        <?php
+    }
+
     private function get_auth_url() {
         $client_id = get_option('ml_client_id');
         $redirect_uri = get_option('ml_redirect_uri');
         return "https://auth.mercadolivre.com.br/authorization?response_type=code&client_id={$client_id}&redirect_uri={$redirect_uri}";
+    }
+
+    public function get_access_token() {
+        $settings = get_option($this->option_name, []);
+        if (empty($settings['access_token'])) {
+            return false;
+        }
+
+        // Verificar expiração (com margem de 5 minutos)
+        $expires = isset($settings['token_expires']) ? (int) $settings['token_expires'] : 0;
+        if (time() + 300 >= $expires) {
+            return $this->refresh_access_token();
+        }
+
+        return $settings['access_token'];
+    }
+
+    private function refresh_access_token() {
+        $settings = get_option($this->option_name, []);
+        if (empty($settings['refresh_token'])) {
+            error_log('ML Sync: Tentativa de refresh sem refresh_token.');
+            return false;
+        }
+
+        $client_id = get_option('ml_client_id');
+        $client_secret = get_option('ml_client_secret');
+
+        $response = wp_remote_post('https://api.mercadolibre.com/oauth/token', [
+            'body' => [
+                'grant_type'    => 'refresh_token',
+                'client_id'     => $client_id,
+                'client_secret' => $client_secret,
+                'refresh_token' => $settings['refresh_token'],
+            ]
+        ]);
+
+        if (is_wp_error($response)) {
+            error_log('ML Sync: Erro no refresh token: ' . $response->get_error_message());
+            return false;
+        }
+
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        if (empty($body['access_token'])) {
+            error_log('ML Sync: Erro no refresh token: ' . wp_remote_retrieve_body($response));
+            return false;
+        }
+
+        $settings['access_token'] = $body['access_token'];
+        $settings['refresh_token'] = $body['refresh_token'];
+        $settings['token_expires'] = time() + (int) $body['expires_in'];
+        update_option($this->option_name, $settings);
+
+        error_log('ML Sync: Token renovado com sucesso.');
+        return $body['access_token'];
+    }
+
+    public function request_ml($method, $endpoint, $body = null) {
+        $token = $this->get_access_token();
+        if (!$token) {
+            return new WP_Error('no_token', 'Acesso não autorizado ao Mercado Livre.');
+        }
+
+        $args = [
+            'method'  => strtoupper($method),
+            'headers' => [
+                'Authorization' => 'Bearer ' . $token,
+                'Content-Type'  => 'application/json',
+            ],
+            'timeout' => 30,
+        ];
+
+        if ($body !== null) {
+            $args['body'] = wp_json_encode($body);
+        }
+
+        $url = $this->api_url . '/' . ltrim($endpoint, '/');
+        $response = wp_remote_request($url, $args);
+
+        // Se falhar com 401, tenta um refresh forçado uma única vez
+        if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 401) {
+             $token = $this->refresh_access_token();
+             if ($token) {
+                 $args['headers']['Authorization'] = 'Bearer ' . $token;
+                 $response = wp_remote_request($url, $args);
+             }
+        }
+
+        return $response;
     }
 
     public function register_rest_routes() {
@@ -834,12 +1259,9 @@ class ML_Sync {
         }
 
         $date_from = date('Y-m-d\TH:i:s.000-03:00', strtotime("-{$days} days"));
-        $url = $this->api_url . '/orders/search?seller=' . $settings['user_id'] . '&order.date_created.from=' . urlencode($date_from) . '&limit=1';
+        $url = '/orders/search?seller=' . $settings['user_id'] . '&order.date_created.from=' . urlencode($date_from) . '&limit=1';
         
-        $response = wp_remote_get($url, [
-            'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']],
-            'timeout' => 10
-        ]);
+        $response = $this->request_ml('GET', $url);
 
         if (is_wp_error($response)) {
             return new WP_REST_Response(['count' => 0, 'error' => $response->get_error_message()], 200);
@@ -934,15 +1356,7 @@ class ML_Sync {
     }
 
     private function update_wc_product_from_ml($resource) {
-        $settings = get_option($this->option_name, []);
-        if (empty($settings['access_token'])) return;
-
-        $url = $this->api_url . $resource;
-        $response = wp_remote_get($url, [
-            'headers' => [
-                'Authorization' => 'Bearer ' . $settings['access_token']
-            ]
-        ]);
+        $response = $this->request_ml('GET', $resource);
 
         if (is_wp_error($response)) return;
 
@@ -988,15 +1402,16 @@ class ML_Sync {
                 add_action('woocommerce_update_product', [$this, 'sync_product_to_ml'], 10, 1);
                 add_action('woocommerce_product_set_stock', [$this, 'sync_stock_to_ml'], 10, 1);
                 add_action('transition_post_status', [$this, 'handle_product_status_change'], 10, 3);
+
+                $this->log_sync('ml_to_wc', 'product_update', 'success',
+                    sprintf('Estoque %d, status ML "%s"', (int)$ml_item['available_quantity'], $ml_item['status']),
+                    ['wc_product_id' => $product_id, 'ml_item_id' => $ml_item['id']]);
             }
         }
     }
 
     public function sync_product_to_ml($product_id) {
         if (get_option('ml_sync_status', 'active') !== 'active') return;
-
-        $settings = get_option($this->option_name, []);
-        if (empty($settings['access_token'])) return;
 
         $product = wc_get_product($product_id);
         if (!$product) return;
@@ -1007,14 +1422,9 @@ class ML_Sync {
         $stock = $product->get_stock_quantity() ? $product->get_stock_quantity() : 1;
         $title = $product->get_name();
         
-        $image_id = $product->get_image_id();
-        $pictures = [];
-        if ($image_id) {
-            $image_url = wp_get_attachment_url($image_id);
-            if ($image_url) {
-                $pictures[] = ['source' => $image_url];
-            }
-        }
+        $picture_urls = $this->get_product_picture_urls($product);
+        $pictures = array_map(function($u) { return ['source' => $u]; }, $picture_urls);
+        $current_pictures_hash = !empty($picture_urls) ? md5(implode('|', $picture_urls)) : '';
 
         if (empty($ml_item_id)) {
             // Criar novo anúncio no ML — só quando não existe
@@ -1034,50 +1444,70 @@ class ML_Sync {
                 'pictures' => $pictures
             ];
 
-            $response = wp_remote_post($this->api_url . '/items', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $settings['access_token'],
-                    'Content-Type' => 'application/json'
-                ],
-                'body' => wp_json_encode($body)
-            ]);
+            $response = $this->request_ml('POST', '/items', $body);
 
             if (!is_wp_error($response)) {
                 $ml_data = json_decode(wp_remote_retrieve_body($response), true);
                 if (isset($ml_data['id'])) {
                     $product->update_meta_data('_ml_item_id', $ml_data['id']);
+                    $product->update_meta_data('_ml_last_pictures_hash', $current_pictures_hash);
                     $product->save_meta_data();
+                    $this->log_sync('wc_to_ml', 'product_create', 'success',
+                        sprintf('Anúncio criado com %d foto(s)', count($pictures)),
+                        ['wc_product_id' => $product_id, 'ml_item_id' => $ml_data['id'], 'payload' => ['pictures' => $picture_urls]]);
                 } else {
                     error_log('ML Sync Create Error: ' . print_r($ml_data, true));
+                    $this->log_sync('wc_to_ml', 'product_create', 'error',
+                        'Falha ao criar anúncio: ' . ($ml_data['message'] ?? 'erro desconhecido'),
+                        ['wc_product_id' => $product_id, 'payload' => $ml_data]);
                 }
+            } else {
+                $this->log_sync('wc_to_ml', 'product_create', 'error',
+                    'Erro de rede: ' . $response->get_error_message(),
+                    ['wc_product_id' => $product_id]);
             }
         } else {
             // Atualizar anúncio existente — preço, estoque e título (SEM status)
-            // ML API rejeita 'status' junto com outros campos no mesmo PUT
             $body = [
                 'price' => (float) $price,
                 'available_quantity' => (int) ($stock ? $stock : 1)
             ];
 
-            if (!empty($pictures)) {
+            // Só envia fotos quando mudaram. Evita sobrescrever as fotos do ML
+            // a cada save do produto (qualquer alteração disparava reenvio só da featured).
+            $last_pictures_hash = $product->get_meta('_ml_last_pictures_hash');
+            $pictures_changed = !empty($pictures) && ($current_pictures_hash !== $last_pictures_hash);
+
+            if ($pictures_changed) {
                 $body['pictures'] = $pictures;
             }
 
-            $response = wp_remote_request($this->api_url . '/items/' . $ml_item_id, [
-                'method' => 'PUT',
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $settings['access_token'],
-                    'Content-Type' => 'application/json'
-                ],
-                'body' => wp_json_encode($body)
-            ]);
+            $response = $this->request_ml('PUT', '/items/' . $ml_item_id, $body);
 
             if (is_wp_error($response)) {
                 error_log('ML Sync Update Error: ' . $response->get_error_message());
+                $this->log_sync('wc_to_ml', 'product_update', 'error',
+                    'Erro de rede: ' . $response->get_error_message(),
+                    ['wc_product_id' => $product_id, 'ml_item_id' => $ml_item_id]);
             } else {
                 $ml_data = json_decode(wp_remote_retrieve_body($response), true);
                 if (!empty($ml_data['error'])) {
                     error_log('ML Sync Update API Error [' . $ml_item_id . ']: ' . ($ml_data['message'] ?? $ml_data['error']));
+                    $this->log_sync('wc_to_ml', 'product_update', 'error',
+                        'API ML: ' . ($ml_data['message'] ?? $ml_data['error']),
+                        ['wc_product_id' => $product_id, 'ml_item_id' => $ml_item_id, 'payload' => $ml_data]);
+                } else {
+                    $msg = sprintf('Preço R$ %.2f, estoque %d', (float)$price, (int)$stock);
+                    if ($pictures_changed) {
+                        $msg .= sprintf(', %d foto(s) atualizadas', count($pictures));
+                        $product->update_meta_data('_ml_last_pictures_hash', $current_pictures_hash);
+                        $product->save_meta_data();
+                        $this->log_sync('wc_to_ml', 'product_pictures', 'success',
+                            sprintf('Enviadas %d foto(s) ao ML', count($pictures)),
+                            ['wc_product_id' => $product_id, 'ml_item_id' => $ml_item_id, 'payload' => ['pictures' => $picture_urls]]);
+                    }
+                    $this->log_sync('wc_to_ml', 'product_update', 'success', $msg,
+                        ['wc_product_id' => $product_id, 'ml_item_id' => $ml_item_id]);
                 }
             }
         }
@@ -1085,9 +1515,6 @@ class ML_Sync {
 
     public function sync_stock_to_ml($product) {
         if (get_option('ml_sync_status', 'active') !== 'active') return;
-
-        $settings = get_option($this->option_name, []);
-        if (empty($settings['access_token'])) return;
 
         $product_obj = is_numeric($product) ? wc_get_product($product) : $product;
         if (!$product_obj) return;
@@ -1099,20 +1526,21 @@ class ML_Sync {
         $post_status = get_post_status($product_obj->get_id());
 
         // 1) Atualiza estoque
-        wp_remote_request($this->api_url . '/items/' . $ml_item_id, [
-            'method' => 'PUT',
-            'headers' => [
-                'Authorization' => 'Bearer ' . $settings['access_token'],
-                'Content-Type' => 'application/json'
-            ],
-            'body' => wp_json_encode(['available_quantity' => max((int) $stock, 0)])
-        ]);
+        $response = $this->request_ml('PUT', '/items/' . $ml_item_id, ['available_quantity' => max((int) $stock, 0)]);
 
-        // 2) Atualiza status separadamente (ML não aceita status junto com outros campos)
+        if (is_wp_error($response)) {
+            $this->log_sync('wc_to_ml', 'stock_update', 'error', 'Erro de rede: ' . $response->get_error_message(),
+                ['wc_product_id' => $product_obj->get_id(), 'ml_item_id' => $ml_item_id]);
+        } else {
+            $this->log_sync('wc_to_ml', 'stock_update', 'success', 'Estoque atualizado: ' . max((int)$stock, 0),
+                ['wc_product_id' => $product_obj->get_id(), 'ml_item_id' => $ml_item_id]);
+        }
+
+        // 2) Atualiza status separadamente
         if ($stock > 0 && $post_status === 'publish') {
-            $this->update_ml_item_status($ml_item_id, 'active', $settings['access_token']);
+            $this->update_ml_item_status($ml_item_id, 'active', $product_obj->get_id());
         } elseif ($stock <= 0) {
-            $this->update_ml_item_status($ml_item_id, 'paused', $settings['access_token']);
+            $this->update_ml_item_status($ml_item_id, 'paused', $product_obj->get_id());
         }
     }
 
@@ -1125,9 +1553,6 @@ class ML_Sync {
         if ($new_status === $old_status) return;
         if (get_option('ml_sync_status', 'active') !== 'active') return;
 
-        $settings = get_option($this->option_name, []);
-        if (empty($settings['access_token'])) return;
-
         $product = wc_get_product($post->ID);
         if (!$product) return;
 
@@ -1138,10 +1563,10 @@ class ML_Sync {
             $stock = $product->get_stock_quantity();
             $manage_stock = $product->get_manage_stock();
             if (!$manage_stock || $stock > 0) {
-                $this->update_ml_item_status($ml_item_id, 'active', $settings['access_token']);
+                $this->update_ml_item_status($ml_item_id, 'active', $product->get_id());
             }
         } elseif (in_array($new_status, ['draft', 'pending', 'trash', 'private'])) {
-            $this->update_ml_item_status($ml_item_id, 'paused', $settings['access_token']);
+            $this->update_ml_item_status($ml_item_id, 'paused', $product->get_id());
         }
     }
 
@@ -1149,21 +1574,23 @@ class ML_Sync {
      * Envia PUT com APENAS o campo status para o ML.
      * ML rejeita status misturado com title/price/pictures/available_quantity.
      */
-    private function update_ml_item_status($ml_item_id, $status, $access_token) {
-        $response = wp_remote_request($this->api_url . '/items/' . $ml_item_id, [
-            'method' => 'PUT',
-            'headers' => [
-                'Authorization' => 'Bearer ' . $access_token,
-                'Content-Type' => 'application/json'
-            ],
-            'body' => wp_json_encode(['status' => $status])
-        ]);
+    private function update_ml_item_status($ml_item_id, $status, $wc_product_id = null) {
+        $response = $this->request_ml('PUT', '/items/' . $ml_item_id, ['status' => $status]);
 
-        if (!is_wp_error($response)) {
-            $ml_data = json_decode(wp_remote_retrieve_body($response), true);
-            if (!empty($ml_data['error'])) {
-                error_log('ML Status Change Error [' . $ml_item_id . ' -> ' . $status . ']: ' . ($ml_data['message'] ?? $ml_data['error']));
-            }
+        if (is_wp_error($response)) {
+            $this->log_sync('wc_to_ml', 'status_update', 'error', 'Rede: ' . $response->get_error_message(),
+                ['wc_product_id' => $wc_product_id, 'ml_item_id' => $ml_item_id, 'payload' => ['status' => $status]]);
+            return;
+        }
+
+        $ml_data = json_decode(wp_remote_retrieve_body($response), true);
+        if (!empty($ml_data['error'])) {
+            error_log('ML Status Change Error [' . $ml_item_id . ' -> ' . $status . ']: ' . ($ml_data['message'] ?? $ml_data['error']));
+            $this->log_sync('wc_to_ml', 'status_update', 'error', 'API ML: ' . ($ml_data['message'] ?? $ml_data['error']),
+                ['wc_product_id' => $wc_product_id, 'ml_item_id' => $ml_item_id, 'payload' => ['status' => $status]]);
+        } else {
+            $this->log_sync('wc_to_ml', 'status_update', 'success', 'Status alterado para: ' . $status,
+                ['wc_product_id' => $wc_product_id, 'ml_item_id' => $ml_item_id]);
         }
     }
 
@@ -1255,17 +1682,14 @@ class ML_Sync {
     public function sync_recent_ml_orders() {
         if (get_option('ml_sync_status', 'active') !== 'active') return;
 
-        $settings = get_option($this->option_name, []);
-        if (empty($settings['access_token']) || empty($settings['user_id'])) return;
+        $user_id = get_option('ml_user_id');
+        if (empty($user_id)) return;
 
         // 1. Busca pedidos novos dos últimos 2 dias
         $date_from = date('Y-m-d\TH:i:s.000\Z', strtotime('-2 days'));
-        $url = $this->api_url . '/orders/search?seller=' . $settings['user_id'] . '&order.date_created.from=' . $date_from;
+        $url = '/orders/search?seller=' . $user_id . '&order.date_created.from=' . $date_from;
         
-        $response = wp_remote_get($url, [
-            'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']],
-            'timeout' => 15
-        ]);
+        $response = $this->request_ml('GET', $url);
 
         if (!is_wp_error($response)) {
             $body = json_decode(wp_remote_retrieve_body($response), true);
@@ -1275,7 +1699,7 @@ class ML_Sync {
                 }
             }
         } else {
-            error_log('ML Sync Order Error: ' . $response->get_error_message());
+            error_log('ML Sync Order Search Error: ' . $response->get_error_message());
         }
 
         // 2. Atualiza status de pedidos WC que ainda não estão finalizados
@@ -1297,14 +1721,7 @@ class ML_Sync {
     }
 
     public function sync_wc_order_from_ml($ml_order_id) {
-        $settings = get_option($this->option_name, []);
-        if (empty($settings['access_token'])) return;
-
-        // Busca dados do pedido no ML
-        $url = $this->api_url . '/orders/' . $ml_order_id;
-        $response = wp_remote_get($url, [
-            'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']]
-        ]);
+        $response = $this->request_ml('GET', '/orders/' . $ml_order_id);
 
         if (is_wp_error($response)) {
             error_log('ML Sync Order Fetch Error: ' . $response->get_error_message());
@@ -1348,6 +1765,8 @@ class ML_Sync {
                 $label = $status_labels[$new_wc_status] ?? $new_wc_status;
                 $wc_order->set_status($new_wc_status, "Status atualizado pelo ML: {$label}.");
                 $wc_order->save();
+                $this->log_sync('ml_to_wc', 'order_update', 'success', sprintf('Status: %s → %s', $current_status, $new_wc_status),
+                    ['wc_order_id' => $wc_order->get_id(), 'ml_order_id' => (string)$ml_order_id]);
             }
             return;
         }
@@ -1445,6 +1864,10 @@ class ML_Sync {
             $wc_order->set_status($new_wc_status, "Status atualizado pelo ML: {$label}.");
             $wc_order->save();
         }
+
+        $this->log_sync('ml_to_wc', 'order_create', 'success',
+            sprintf('Pedido criado: total R$ %.2f, status %s', (float)$ml_total_amount, $new_wc_status),
+            ['wc_order_id' => $wc_order->get_id(), 'ml_order_id' => (string)$ml_order_id]);
     }
 
     /**
@@ -1477,11 +1900,7 @@ class ML_Sync {
         foreach ($payments as $payment) {
             if (empty($payment['id']) || $payment['status'] !== 'approved') continue;
 
-            $col_url = $this->api_url . '/collections/' . $payment['id'];
-            $col_response = wp_remote_get($col_url, [
-                'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']],
-                'timeout' => 10
-            ]);
+            $col_response = $this->request_ml('GET', '/collections/' . $payment['id']);
 
             if (!is_wp_error($col_response)) {
                 $col_data = json_decode(wp_remote_retrieve_body($col_response), true);
@@ -1561,11 +1980,7 @@ class ML_Sync {
         if (empty($ml_order['shipping']['id'])) return;
 
         $settings = get_option($this->option_name, []);
-        $ship_url = $this->api_url . '/shipments/' . $ml_order['shipping']['id'];
-        $ship_response = wp_remote_get($ship_url, [
-            'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']],
-            'timeout' => 10
-        ]);
+        $ship_response = $this->request_ml('GET', '/shipments/' . $ml_order['shipping']['id']);
 
         if (is_wp_error($ship_response)) return;
 
@@ -1619,10 +2034,7 @@ class ML_Sync {
         if (!$ml_order_id) return;
 
         $settings = get_option($this->option_name, []);
-        $url = $this->api_url . '/orders/' . $ml_order_id;
-        $response = wp_remote_get($url, [
-            'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']]
-        ]);
+        $response = $this->request_ml('GET', '/orders/' . $ml_order_id);
 
         if (is_wp_error($response)) {
             $order->add_order_note('Falha ao sincronizar com ML: ' . $response->get_error_message());
@@ -1668,10 +2080,7 @@ class ML_Sync {
             if (!$ml_order_id) continue;
 
             // Busca dados atualizados do pedido no ML
-            $url = $this->api_url . '/orders/' . $ml_order_id;
-            $response = wp_remote_get($url, [
-                'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']]
-            ]);
+            $response = $this->request_ml('GET', '/orders/' . $ml_order_id);
 
             if (is_wp_error($response)) continue;
 
@@ -1741,22 +2150,16 @@ class ML_Sync {
     // --- MÉTODOS DE IMPORTAÇÃO ASSÍNCRONA ---
 
     private function enqueue_all_ml_products() {
-        $settings = get_option($this->option_name, []);
-        if (empty($settings['access_token']) || empty($settings['user_id'])) return 0;
-
-        // Fetch paginado de todos os itens do usuário no ML (limit 100 max, precisa de paginação real para contas grandes)
-        // Por simplicidade na primeira versão, buscamos tudo em uma requisição grande se houver poucos,
-        // mas idealmente usaríamos offset.
+        $user_id = get_option('ml_user_id');
+        if (empty($user_id)) return 0;
         
         $item_ids = [];
         $offset = 0;
         $limit = 50;
 
         do {
-            $url = $this->api_url . '/users/' . $settings['user_id'] . "/items/search?limit={$limit}&offset={$offset}";
-            $response = wp_remote_get($url, [
-                'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']]
-            ]);
+            $url = "/users/{$user_id}/items/search?limit={$limit}&offset={$offset}";
+            $response = $this->request_ml('GET', $url);
 
             if (is_wp_error($response)) break;
 
@@ -1802,17 +2205,10 @@ class ML_Sync {
     }
 
     public function process_single_import_item($ml_item_id) {
-        $settings = get_option($this->option_name, []);
-        if (empty($settings['access_token'])) return;
-
         $status = get_option('ml_import_status', ['total' => 0, 'processed' => 0, 'errors' => []]);
 
         try {
-            $item_url = $this->api_url . '/items/' . $ml_item_id;
-            $item_response = wp_remote_get($item_url, [
-                'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']],
-                'timeout' => 15
-            ]);
+            $item_response = $this->request_ml('GET', '/items/' . $ml_item_id);
 
             if (is_wp_error($item_response)) {
                 throw new Exception("Falha na requisição: " . $item_response->get_error_message());
@@ -1846,6 +2242,7 @@ class ML_Sync {
             // Impede recursão
             remove_action('woocommerce_update_product', [$this, 'sync_product_to_ml'], 10);
             remove_action('woocommerce_product_set_stock', [$this, 'sync_stock_to_ml'], 10);
+            remove_action('transition_post_status', [$this, 'handle_product_status_change'], 10);
 
             $product->set_name($ml_item['title']);
             $product->set_price($ml_item['price']);
@@ -1917,8 +2314,7 @@ class ML_Sync {
                 // Tenta buscar nome da categoria somente se não houver ainda
                 $existing_cat_name = $product->get_meta('_ml_category_name');
                 if (empty($existing_cat_name)) {
-                    $cat_url = $this->api_url . '/categories/' . $ml_item['category_id'];
-                    $cat_response = wp_remote_get($cat_url, ['timeout' => 15]);
+                    $cat_response = $this->request_ml('GET', '/categories/' . $ml_item['category_id']);
                     if (!is_wp_error($cat_response)) {
                         $cat_body = json_decode(wp_remote_retrieve_body($cat_response), true);
                         if (!empty($cat_body['name'])) {
@@ -1929,11 +2325,7 @@ class ML_Sync {
             }
             
             // Descrição (PlainText)
-            $desc_url = $this->api_url . '/items/' . $ml_item_id . '/description';
-            $desc_response = wp_remote_get($desc_url, [
-                'headers' => ['Authorization' => 'Bearer ' . $settings['access_token']],
-                'timeout' => 15
-            ]);
+            $desc_response = $this->request_ml('GET', '/items/' . $ml_item_id . '/description');
 
             if (!is_wp_error($desc_response)) {
                 $desc_body = json_decode(wp_remote_retrieve_body($desc_response), true);
@@ -2015,17 +2407,23 @@ class ML_Sync {
             }
 
             // Sucesso!
+            $this->log_sync('ml_to_wc', 'product_update', 'success',
+                sprintf('Importado: %d foto(s), estoque %d', count($ml_item['pictures'] ?? []), (int)($ml_item['available_quantity'] ?? 0)),
+                ['wc_product_id' => $product_id, 'ml_item_id' => $ml_item_id]);
         } catch (Exception $e) {
             // Falha
             $status['errors'][] = ['id' => $ml_item_id, 'msg' => $e->getMessage()];
+            $this->log_sync('ml_to_wc', 'product_update', 'error', $e->getMessage(),
+                ['ml_item_id' => $ml_item_id]);
         } finally {
             // Sempre adiciona processado, quer deu erro ou não
             $status['processed']++;
             update_option('ml_import_status', $status);
             
             // Re-habilita
-            add_action('woocommerce_update_product', [$this, 'sync_product_to_ml'], 10, 1);
-            add_action('woocommerce_product_set_stock', [$this, 'sync_stock_to_ml'], 10, 1);
+            add_action('woocommerce_update_product', [$this, 'sync_product_to_ml'], 10);
+            add_action('woocommerce_product_set_stock', [$this, 'sync_stock_to_ml'], 10);
+            add_action('transition_post_status', [$this, 'handle_product_status_change'], 10);
         }
     }
 }

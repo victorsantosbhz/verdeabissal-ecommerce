@@ -6,7 +6,35 @@ Este projeto é um e-commerce baseado em WordPress + WooCommerce com integraçã
 
 - `Dockerfile`: Configura o WordPress com o plugin WooCommerce pré-instalado.
 - `docker-compose.yml`: Orquestra o container do WordPress e o Banco de Dados MySQL.
-- `wp-content/plugins/ml-sync/`: Plugin customizado para integração com a API do Mercado Livre.
+- `wordpress_data/`: Diretório montado em `/var/www/html` no container. **Todos os plugins (de terceiros e customizados) ficam em `wordpress_data/wp-content/plugins/`**.
+
+### Plugins customizados desenvolvidos neste projeto
+
+- `wordpress_data/wp-content/plugins/ml-sync/`: integração com a API do Mercado Livre.
+- `wordpress_data/wp-content/plugins/va-product-order/`: ordenação de produtos por estoque & vendas.
+- `wordpress_data/wp-content/plugins/verdeabissal-calc-aquario/`: calculadora de aquário (cortes do vidro, espessura, peso total).
+
+> **Importante:** ao criar um plugin novo, basta colocá-lo em `wordpress_data/wp-content/plugins/<seu-plugin>/` — ele já fica disponível dentro do container automaticamente, sem precisar editar o `docker-compose.yml`.
+
+## Recarregando o ambiente quando você cria/edita um plugin
+
+Mudanças em arquivos PHP são pegas no ato pelo Apache (não precisa reiniciar). **Mas** quando você:
+- adiciona um plugin novo;
+- mexe no `docker-compose.yml`;
+- mexe no `Dockerfile`;
+
+…é preciso recriar o container para que o WordPress enxergue o novo conteúdo:
+
+```bash
+docker compose down
+docker compose up -d --build
+```
+
+Se o plugin novo não aparece no painel mesmo após `up -d`, force a recriação:
+
+```bash
+docker compose up -d --force-recreate wordpress
+```
 
 ## Como Começar
 
